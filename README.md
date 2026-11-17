@@ -4,7 +4,7 @@
 
 Block Devices is a read-only Linux block-device topology, geometry, mapping and signature inspector. Normal inventory acquisition stays close to the kernel's sysfs block model, with deeper actions kept explicit.
 
-Current release: **0.0.13**
+Current release: **0.0.20**
 
 Repository: <https://github.com/linspectacles/block-devices>
 
@@ -32,15 +32,14 @@ The applet reports information available from its documented Linux sources. Data
 - Partition start/end/offset/length information plus logical/physical block geometry, alignment and discard metadata where exposed.
 - Explicit parent/partition, holders and slaves relationships.
 - Read-only **Layout...** view using the current snapshot.
-- Read-only **Mapping Details...** view for stacked block topology from the current snapshot.
-- Explicit **Signatures...** selected-device probe through `libblkid`; it is never run by ordinary Refresh.
+- Selected-device **Device Details...** dialog with **Mapping** and **Signatures** tabs. Mapping uses the current snapshot; opening Signatures performs the explicit ordinary `libblkid` probe, which is never run by ordinary Refresh. If raw-device access is restricted, the Signatures tab can offer one explicit selected-device privileged retry through `pkexec` and `blkid -p`; privileged results use the LinSpectacles privilege provenance palette and collapse when the user leaves the Signatures tab.
 - Deeper Device Mapper and MD RAID metadata where exposed by the collected kernel interfaces.
 
 ## Data sources and acquisition
 
 - `/sys/class/block` and per-device sysfs attributes.
 - `/sys/class/block/<device>/holders` and `/sys/class/block/<device>/slaves`.
-- `libblkid` only for the explicit selected-device **Signatures...** action.
+- `libblkid` only when the selected-device **Signatures** tab is opened. If ordinary raw-device access is restricted, an explicit one-shot privileged retry uses `pkexec` with `blkid -p` for that selected device only.
 
 The applet uses those sources according to the acquisition paths implemented in this release. Optional tools or privileged helpers only affect the views/actions that explicitly use them; they are not treated as silent substitutes for unrelated sources.
 
@@ -59,6 +58,7 @@ Ordinary Refresh does not invoke `lsblk`, the `blkid` CLI, `udevadm`, `dmsetup`,
 | Command | Shortcut |
 | --- | --- |
 | Show / hide Metadata Details | `F3` |
+| Open selected-device details | `F4` |
 | Toggle Horizontal / Vertical details | `Ctrl+L` |
 | Refresh block inventory | `Shift+F5` |
 | Options | `Ctrl+/` |

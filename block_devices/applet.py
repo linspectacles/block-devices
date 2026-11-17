@@ -9,11 +9,14 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import json
+import os
 import re
+import shutil
+import subprocess
 
 APPLET_ID = "linspectacles-block-devices"
 APPLET_NAME = "Block Devices"
-APPLET_VERSION = "0.0.13"
+APPLET_VERSION = "0.0.20"
 APPLET_AUTHOR = "brunonlinespace"
 APPLET_EDITOR = "brunonlinespace"
 APPLET_PUBLISHER = "brunonlinespace"
@@ -308,12 +311,12 @@ def _metadata_lines(record, acquired_at):
         _kv(lines, "Probe Status", probe.get("status") or "Unknown")
     else:
         _heading(lines, "CONTENT PROBE")
-        _kv(lines, "Status", "Not run — use Signatures… for an explicit selected-device probe")
+        _kv(lines, "Status", "Not run — open the Signatures tab for an explicit selected-device probe")
 
     _heading(lines, "SOURCE")
     _kv(lines, "Primary Inventory", "/sys/class/block")
     _kv(lines, "Device Attributes", "per-device sysfs")
-    _kv(lines, "Secondary Probe", "libblkid — explicit Signatures… action only")
+    _kv(lines, "Secondary Probe", "libblkid — explicit Signatures tab only")
     _kv(lines, "Acquired", acquired_at.isoformat(timespec="seconds") if acquired_at else "Unavailable")
     return lines
 
@@ -395,16 +398,50 @@ class LayoutDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close); buttons.rejected.connect(self.reject); root.addWidget(buttons)
 
 
-class MappingDetailsDialog(QDialog):
+class DeviceDetailsDialog(QDialog):
     def __init__(self, owner, selected, by_name):
         super().__init__(owner)
-        self.setWindowTitle(f"Mapping Details — {selected.get('name','')}")
-        self.resize(980, 640)
+        self.owner = owner
+        self.selected = selected
+        self.by_name = by_name
+        self._signatures_loaded = False
+        self._signatures_privileged_active = False
+        self._ordinary_probe = None
+        self.setWindowTitle(f"Device Details — {selected.get('name','')}")
+        self.resize(980, 680)
+
         root = QVBoxLayout(self)
-        note = QLabel("Read-only block topology from the current sysfs snapshot. Parent/partition relationships are kept distinct from holders/slaves relationships.")
-        note.setWordWrap(True); root.addWidget(note)
-        tree = QTreeWidget(); tree.setColumnCount(5); tree.setHeaderLabels(["Device", "Category", "Major:Minor", "Size", "Relationship"])
-        root.addWidget(tree, 1)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_mapping_tab(), "Mapping")
+        self.signatures_tab = self._build_signatures_tab()
+        self.signatures_index = self.tabs.addTab(self.signatures_tab, "Signatures")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        root.addWidget(self.tabs, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _build_mapping_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        note = QLabel(
+            "Read-only block topology from the current sysfs snapshot. "
+            "Parent/partition relationships are kept distinct from holders/slaves relationships."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        tree = QTreeWidget()
+        tree.setColumnCount(5)
+        tree.setHeaderLabels(["Device", "Category", "Major:Minor", "Size", "Relationship"])
+        layout.addWidget(tree, 1)
 
         def add_node(parent_item, record, relation, visited, direction):
             key = str(record.get("major_minor") or record.get("sysfs_path") or record.get("name"))
@@ -419,75 +456,319 @@ class MappingDetailsDialog(QDialog):
             parent_item.addChild(item)
             if repeated:
                 return
-            next_visited = set(visited); next_visited.add(key)
+            next_visited = set(visited)
+            next_visited.add(key)
             names = record.get("holders") if direction == "up" else record.get("slaves")
             for name in names or []:
-                target = by_name.get(name)
+                target = self.by_name.get(name)
                 if target:
-                    add_node(item, target, "Holding block device" if direction == "up" else "Underlying block device", next_visited, direction)
+                    add_node(
+                        item,
+                        target,
+                        "Holding block device" if direction == "up" else "Underlying block device",
+                        next_visited,
+                        direction,
+                    )
 
-        above = QTreeWidgetItem(["HOLDING / ABOVE", "", "", "", ""]); tree.addTopLevelItem(above)
-        for name in selected.get("holders") or []:
-            if name in by_name: add_node(above, by_name[name], "Holding block device", set(), "up")
-        if above.childCount() == 0: above.addChild(QTreeWidgetItem(["None reported", "", "", "", ""]))
+        above = QTreeWidgetItem(["HOLDING / ABOVE", "", "", "", ""])
+        tree.addTopLevelItem(above)
+        for name in self.selected.get("holders") or []:
+            if name in self.by_name:
+                add_node(above, self.by_name[name], "Holding block device", set(), "up")
+        if above.childCount() == 0:
+            above.addChild(QTreeWidgetItem(["None reported", "", "", "", ""]))
 
-        center = QTreeWidgetItem(["SELECTED DEVICE", "", "", "", ""]); tree.addTopLevelItem(center)
-        center.addChild(QTreeWidgetItem([selected.get("name", ""), selected.get("category", ""), selected.get("major_minor", ""), format_bytes(selected.get("size_bytes")), "Selected block object"]))
+        center = QTreeWidgetItem(["SELECTED DEVICE", "", "", "", ""])
+        tree.addTopLevelItem(center)
+        center.addChild(QTreeWidgetItem([
+            self.selected.get("name", ""),
+            self.selected.get("category", ""),
+            self.selected.get("major_minor", ""),
+            format_bytes(self.selected.get("size_bytes")),
+            "Selected block object",
+        ]))
 
-        below = QTreeWidgetItem(["UNDERLYING / BELOW", "", "", "", ""]); tree.addTopLevelItem(below)
-        for name in selected.get("slaves") or []:
-            if name in by_name: add_node(below, by_name[name], "Underlying block device", set(), "down")
-        if below.childCount() == 0: below.addChild(QTreeWidgetItem(["None reported", "", "", "", ""]))
+        below = QTreeWidgetItem(["UNDERLYING / BELOW", "", "", "", ""])
+        tree.addTopLevelItem(below)
+        for name in self.selected.get("slaves") or []:
+            if name in self.by_name:
+                add_node(below, self.by_name[name], "Underlying block device", set(), "down")
+        if below.childCount() == 0:
+            below.addChild(QTreeWidgetItem(["None reported", "", "", "", ""]))
 
-        family = QTreeWidgetItem(["PARENT / PARTITIONS", "", "", "", ""]); tree.addTopLevelItem(family)
-        parent_name = selected.get("parent_device")
-        if parent_name and parent_name in by_name:
-            p = by_name[parent_name]
-            family.addChild(QTreeWidgetItem([p.get("name", ""), p.get("category", ""), p.get("major_minor", ""), format_bytes(p.get("size_bytes")), "Parent block device"]))
-        for name in selected.get("partitions") or []:
-            p = by_name.get(name)
-            if p:
-                family.addChild(QTreeWidgetItem([p.get("name", ""), p.get("category", ""), p.get("major_minor", ""), format_bytes(p.get("size_bytes")), "Partition child"]))
-        if family.childCount() == 0: family.addChild(QTreeWidgetItem(["None reported", "", "", "", ""]))
+        family = QTreeWidgetItem(["PARENT / PARTITIONS", "", "", "", ""])
+        tree.addTopLevelItem(family)
+        parent_name = self.selected.get("parent_device")
+        if parent_name and parent_name in self.by_name:
+            parent = self.by_name[parent_name]
+            family.addChild(QTreeWidgetItem([
+                parent.get("name", ""),
+                parent.get("category", ""),
+                parent.get("major_minor", ""),
+                format_bytes(parent.get("size_bytes")),
+                "Parent block device",
+            ]))
+        for name in self.selected.get("partitions") or []:
+            partition = self.by_name.get(name)
+            if partition:
+                family.addChild(QTreeWidgetItem([
+                    partition.get("name", ""),
+                    partition.get("category", ""),
+                    partition.get("major_minor", ""),
+                    format_bytes(partition.get("size_bytes")),
+                    "Partition child",
+                ]))
+        if family.childCount() == 0:
+            family.addChild(QTreeWidgetItem(["None reported", "", "", "", ""]))
 
         tree.expandAll()
-        for i in range(5): tree.resizeColumnToContents(i)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close); buttons.rejected.connect(self.reject); root.addWidget(buttons)
+        for i in range(5):
+            tree.resizeColumnToContents(i)
+        return page
 
+    def _build_signatures_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
-class SignaturesDialog(QDialog):
-    def __init__(self, owner, record, probe):
-        super().__init__(owner)
-        self.setWindowTitle(f"Signatures — {record.get('name','')}")
-        self.resize(780, 620)
-        root = QVBoxLayout(self)
-        note = QLabel("Explicit read-only selected-device probe using libblkid. This probe is never run during ordinary Refresh.")
-        note.setWordWrap(True); root.addWidget(note)
-        text = QTextEdit(); text.setReadOnly(True); text.setFont(owner._metadata_font); text.document().setDefaultFont(owner._metadata_font)
+        note = QLabel(
+            "Explicit read-only selected-device probe. Ordinary access uses libblkid; "
+            "if raw-device access is restricted, one explicit privileged retry may be requested. "
+            "Ordinary Refresh never performs either probe."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.signatures_text = QTextEdit()
+        self.signatures_text.setReadOnly(True)
+        self.signatures_text.setFont(self.owner._metadata_font)
+        self.signatures_text.document().setDefaultFont(self.owner._metadata_font)
+        self._set_signatures_palette(False)
+        self._set_signatures_text(["Open this tab to probe signatures for the selected device."])
+        layout.addWidget(self.signatures_text, 1)
+
+        self.signatures_privileged_btn = QPushButton("Privileged Access...")
+        self.signatures_privileged_btn.clicked.connect(self._probe_signatures_privileged)
+        self.signatures_privileged_btn.setVisible(False)
+        layout.addWidget(self.signatures_privileged_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        return page
+
+    def _set_signatures_palette(self, privileged=False):
+        if privileged:
+            background = "#1e1e1e"
+            foreground = "#dcdcdc"
+            border = "#d6a23d"
+        else:
+            background = "#151719"
+            foreground = "#dcdcdc"
+            border = "#333333"
+        self.signatures_text.setStyleSheet(
+            f"QTextEdit {{ background-color: {background}; color: {foreground}; "
+            f"border: 1px solid {border}; {metadata_font_qss(self.owner._metadata_font)} }}"
+        )
+
+    def _set_signatures_text(self, lines):
+        self.signatures_text.clear()
+        heading_fmt = QTextCharFormat()
+        heading_fmt.setForeground(QColor("#f2d18b" if self._signatures_privileged_active else "#9cdcfe"))
+        heading_fmt.setFontWeight(600)
+        value_fmt = QTextCharFormat()
+        value_fmt.setForeground(QColor("#e5bd70" if self._signatures_privileged_active else "#dcdcdc"))
+        cursor = self.signatures_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        for index, line in enumerate(lines):
+            if line.startswith("--- ") and line.endswith(" ---"):
+                cursor.insertText(line, heading_fmt)
+            elif self._signatures_privileged_active and ":" in line:
+                key, value = line.split(":", 1)
+                cursor.insertText(f"{key}:", heading_fmt)
+                cursor.insertText(value, value_fmt)
+            else:
+                cursor.insertText(line, value_fmt)
+            if index + 1 < len(lines):
+                cursor.insertText("\n", value_fmt)
+        self.signatures_text.setTextCursor(cursor)
+
+    def _on_tab_changed(self, index):
+        if index != self.signatures_index:
+            if self._signatures_privileged_active:
+                self._collapse_privileged_signatures()
+            return
+        if self._signatures_loaded:
+            return
+        self._signatures_loaded = True
+        self._signatures_privileged_active = False
+        self._set_signatures_palette(False)
+        self.owner.set_status(f"Probing signatures for {self.selected.get('name','')}…")
+        QApplication.processEvents()
+        probe = self.owner.provider.probe_signatures(self.selected)
+        self._ordinary_probe = probe
+        self.selected["probe"] = probe
+        self.owner._show_metadata(self.selected)
+        self.owner._update_status()
+        self._render_signatures(probe, access="Ordinary")
+        devnode = str(self.selected.get("devnode") or "")
+        restricted = (
+            probe.get("status") == "Could not open the selected device for read-only probing"
+            and bool(devnode)
+            and Path(devnode).exists()
+            and not os.access(devnode, os.R_OK)
+        )
+        self.signatures_privileged_btn.setVisible(
+            restricted
+            and shutil.which("pkexec") is not None
+            and shutil.which("blkid") is not None
+        )
+
+    def _collapse_privileged_signatures(self):
+        self._signatures_privileged_active = False
+        self._set_signatures_palette(False)
+        self.signatures_privileged_btn.setVisible(False)
+        if self._ordinary_probe is not None:
+            self.selected["probe"] = self._ordinary_probe
+            self.owner._show_metadata(self.selected)
+        self._ordinary_probe = None
+        self._signatures_loaded = False
+        self._set_signatures_text(["Open this tab to probe signatures for the selected device."])
+        self.owner._update_status()
+
+    def _probe_signatures_privileged(self):
+        pkexec = shutil.which("pkexec")
+        blkid = shutil.which("blkid")
+        devnode = str(self.selected.get("devnode") or "")
+        if pkexec is None or blkid is None:
+            probe = {
+                "source": "libblkid via blkid",
+                "devnode": devnode,
+                "available": False,
+                "status": "Privileged signature probing is unavailable because pkexec or blkid was not found",
+                "values": {},
+            }
+            self._render_signatures(probe, access="Restricted")
+            self.signatures_privileged_btn.setVisible(False)
+            return
+
+        self._signatures_privileged_active = True
+        self._set_signatures_palette(True)
+        self.owner.set_status(f"Probing signatures with privileged access for {self.selected.get('name','')}…")
+        QApplication.processEvents()
+        try:
+            result = subprocess.run(
+                [pkexec, blkid, "-p", "-o", "export", devnode],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            probe = {
+                "source": "libblkid via blkid",
+                "devnode": devnode,
+                "available": True,
+                "status": f"Unable to probe the selected device with privileged access: {exc}",
+                "values": {},
+            }
+            self._render_signatures(probe, access="Privileged")
+            self.owner._update_status()
+            return
+
+        if result.returncode not in {0, 2}:
+            detail = (result.stderr or "Privileged signature probe was cancelled or failed.").strip()
+            probe = {
+                "source": "libblkid via blkid",
+                "devnode": devnode,
+                "available": True,
+                "status": detail,
+                "values": {},
+            }
+            self._render_signatures(probe, access="Privileged")
+            self.owner._update_status()
+            return
+
+        values = {}
+        for line in (result.stdout or "").splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key and key != "DEVNAME":
+                values[key] = value
+        probe = {
+            "source": "libblkid via blkid",
+            "devnode": devnode,
+            "available": True,
+            "status": "Probe completed" if values else "No recognized signature was reported",
+            "values": values,
+        }
+        self.selected["probe"] = probe
+        self.owner._show_metadata(self.selected)
+        self.owner._update_status()
+        self.signatures_privileged_btn.setVisible(False)
+        self._render_signatures(probe, access="Privileged")
+
+    def _render_signatures(self, probe, access="Ordinary"):
         values = probe.get("values") or {}
-        part = partition_probe_fields(probe); sig = signature_probe_fields(probe)
-        lines = ["--- PROBE ---", f"Device: {record.get('devnode','')}", f"Source: libblkid", f"Status: {probe.get('status','Unknown')}"]
+        part = partition_probe_fields(probe)
+        sig = signature_probe_fields(probe)
+        lines = [
+            "--- PROBE ---",
+            f"Device: {self.selected.get('devnode','')}",
+            f"Source: {probe.get('source') or 'libblkid'}",
+            f"Access: {access}",
+            f"Status: {probe.get('status','Unknown')}",
+        ]
         if any(part.values()):
             lines += ["", "--- PARTITION TABLE ---"]
             for label, key in [
-                ("Scheme", "scheme"), ("Partition Table UUID", "table_uuid"), ("Partition Number", "partition_number"),
-                ("Partition Type", "partition_type"), ("Partition Type UUID", "partition_type_uuid"), ("Partition UUID", "partition_uuid"),
-                ("Partition Name", "partition_name"), ("Partition Flags", "partition_flags"), ("Partition Offset", "partition_offset"), ("Partition Size", "partition_size")
+                ("Scheme", "scheme"),
+                ("Partition Table UUID", "table_uuid"),
+                ("Partition Number", "partition_number"),
+                ("Partition Type", "partition_type"),
+                ("Partition Type UUID", "partition_type_uuid"),
+                ("Partition UUID", "partition_uuid"),
+                ("Partition Name", "partition_name"),
+                ("Partition Flags", "partition_flags"),
+                ("Partition Offset", "partition_offset"),
+                ("Partition Size", "partition_size"),
             ]:
                 lines.append(f"{label}: {part.get(key) or 'Not reported'}")
         if any(sig.values()):
             lines += ["", "--- CONTENT SIGNATURE ---"]
-            for label, key in [("Usage","usage"),("Type","type"),("Version","version"),("UUID","uuid"),("Label","label")]:
+            for label, key in [
+                ("Usage", "usage"),
+                ("Type", "type"),
+                ("Version", "version"),
+                ("UUID", "uuid"),
+                ("Label", "label"),
+            ]:
                 lines.append(f"{label}: {sig.get(key) or 'Not reported'}")
-        extras = {k: v for k, v in values.items() if k not in {
-            "USAGE", "TYPE", "VERSION", "UUID", "LABEL", "PTTYPE", "PTUUID", "PART_ENTRY_SCHEME", "PART_ENTRY_NUMBER",
-            "PART_ENTRY_TYPE", "PART_ENTRY_UUID", "PART_ENTRY_NAME", "PART_ENTRY_FLAGS", "PART_ENTRY_OFFSET", "PART_ENTRY_SIZE"
-        }}
+        extras = {
+            key: value
+            for key, value in values.items()
+            if key not in {
+                "USAGE",
+                "TYPE",
+                "VERSION",
+                "UUID",
+                "LABEL",
+                "PTTYPE",
+                "PTUUID",
+                "PART_ENTRY_SCHEME",
+                "PART_ENTRY_NUMBER",
+                "PART_ENTRY_TYPE",
+                "PART_ENTRY_UUID",
+                "PART_ENTRY_NAME",
+                "PART_ENTRY_FLAGS",
+                "PART_ENTRY_OFFSET",
+                "PART_ENTRY_SIZE",
+            }
+        }
         if extras:
             lines += ["", "--- ADDITIONAL REPORTED VALUES ---"]
-            for key in sorted(extras): lines.append(f"{key}: {extras[key]}")
-        text.setPlainText("\n".join(lines)); root.addWidget(text, 1)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close); buttons.rejected.connect(self.reject); root.addWidget(buttons)
+            for key in sorted(extras):
+                lines.append(f"{key}: {extras[key]}")
+        self._set_signatures_text(lines)
 
 
 class BlockDevicesOptionsDialog(QDialog):
@@ -516,9 +797,9 @@ class BlockDevicesOptionsDialog(QDialog):
             ("Topology", ["/sys/class/block/<device>/holders", "/sys/class/block/<device>/slaves", "resolved kernel parent/partition topology"]),
             ("Device Mapper", ["per-device sysfs dm attributes"]),
             ("MD RAID", ["per-device sysfs md attributes"]),
-            ("Content / partition probe", ["libblkid, selected device only, explicit Signatures… action", "No probe is performed by Refresh. Probe results live only in the current in-memory snapshot."]),
+            ("Content / partition probe", ["libblkid, selected device only, explicit Signatures tab", "If ordinary raw-device access is restricted, the Signatures tab can request one selected-device privileged probe via pkexec and blkid -p.", "No probe is performed by Refresh. Probe results live only in the current in-memory snapshot."]),
             ("Not used by normal inspection", ["lsblk, blkid CLI, udevadm, dmsetup, mdadm, pvs/vgs/lvs, mount/findmnt, SMART tools"]),
-            ("Access model", ["Read-only. No storage state is modified and no privileged retry is attempted."]),
+            ("Access model", ["Read-only. No storage state is modified. Privileged access, when explicitly requested, is limited to one selected-device blkid -p probe."]),
         ]
         for group_index, (heading, lines) in enumerate(source_groups):
             if group_index:
@@ -594,8 +875,7 @@ class BlockDevicesTab(QWidget):
         root = QVBoxLayout(self); root.setContentsMargins(12,12,12,12); root.setSpacing(10)
         top = QHBoxLayout(); self.stats_label = QLabel("Total Block Devices: 0"); f=self.stats_label.font(); f.setBold(True); f.setPointSize(max(f.pointSize(),11)); self.stats_label.setFont(f); top.addWidget(self.stats_label); top.addStretch(1)
         self.layout_btn = QPushButton("Layout..."); self.layout_btn.clicked.connect(self.show_layout); top.addWidget(self.layout_btn)
-        self.mapping_btn = QPushButton("Mapping Details..."); self.mapping_btn.clicked.connect(self.show_mapping); top.addWidget(self.mapping_btn)
-        self.signatures_btn = QPushButton("Signatures..."); self.signatures_btn.clicked.connect(self.show_signatures); top.addWidget(self.signatures_btn)
+        self.device_details_btn = QPushButton("Device Details..."); self.device_details_btn.clicked.connect(self.show_device_details); top.addWidget(self.device_details_btn)
         self.refresh_btn = QPushButton("Refresh"); self.refresh_btn.clicked.connect(self.refresh_devices); top.addWidget(self.refresh_btn)
         self.options_btn = QPushButton("Options..."); self.options_btn.clicked.connect(self.show_options); top.addWidget(self.options_btn)
         root.addLayout(top)
@@ -617,6 +897,7 @@ class BlockDevicesTab(QWidget):
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("F3"), self, activated=self.toggle_details)
+        QShortcut(QKeySequence("F4"), self, activated=self.show_device_details)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self.toggle_orientation)
         QShortcut(QKeySequence("Ctrl+/"), self, activated=self.show_options)
         QShortcut(QKeySequence("Shift+F5"), self, activated=self.refresh_devices)
@@ -730,13 +1011,11 @@ class BlockDevicesTab(QWidget):
     def _update_actions(self):
         r=self.current_record(); available=bool(r)
         # Unavailable specialist actions are hidden rather than shown disabled.
-        self.signatures_btn.setVisible(available)
-        layout=False; mapping=False
+        self.device_details_btn.setVisible(available)
+        layout=False
         if r:
             layout=bool(r.get("partitions") or r.get("parent_device"))
-            mapping=bool(r.get("parent_device") or r.get("partitions") or r.get("holders") or r.get("slaves"))
         self.layout_btn.setVisible(layout)
-        self.mapping_btn.setVisible(mapping)
 
     def refresh_devices(self,initial=False):
         self.set_status("Refreshing block devices…"); QApplication.processEvents()
@@ -762,16 +1041,11 @@ class BlockDevicesTab(QWidget):
             QMessageBox.information(self,"Layout","No partition objects with positional geometry are present in the current snapshot.");return
         LayoutDialog(self,parent,parts,selected_name).exec()
 
-    def show_mapping(self):
+    def show_device_details(self):
         record=self.current_record()
         if not record:return
-        by_name={r.get("name"):r for r in self.snapshot};MappingDetailsDialog(self,record,by_name).exec()
-
-    def show_signatures(self):
-        record=self.current_record()
-        if not record:return
-        self.set_status(f"Probing signatures for {record.get('name','')}…");QApplication.processEvents()
-        probe=self.provider.probe_signatures(record);record["probe"]=probe;self._show_metadata(record);self._update_status();SignaturesDialog(self,record,probe).exec()
+        by_name={r.get("name"):r for r in self.snapshot}
+        DeviceDetailsDialog(self,record,by_name).exec()
 
     def show_options(self):BlockDevicesOptionsDialog(self).exec()
     def set_status(self,text):self.status.setText(str(text))
